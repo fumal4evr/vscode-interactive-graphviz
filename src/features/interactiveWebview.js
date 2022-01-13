@@ -1,6 +1,7 @@
 "use strict";
 /**
  * @author github.com/tintinweb
+ * @contributor github.com/fumal4evr
  * @license MIT
  *
  * */
@@ -20,8 +21,8 @@ class InteractiveWebviewGenerator {
     this.webviewPanels = new Map();
     this.timeout = null;
     this.content_folder = content_folder;
-    this.imageFiles = [];
-    this.imageResources = [];
+    this.imageFiles = []; // list of image files referenced in original dot document
+    this.imageResources = {}; // map of image files to protected resource names
   }
 
   setNeedsRebuild(uri, needsRebuild) {
@@ -92,8 +93,6 @@ class InteractiveWebviewGenerator {
   }
 
   handleMessage(previewPanel, message) {
-    console.log(`Message received from the webview: ${message.command}`);
-
     switch (message.command) {
       case "onRenderFinished":
         previewPanel.onRenderFinished(message.value.err);
@@ -152,11 +151,11 @@ class InteractiveWebviewGenerator {
     let localResourceRoots = [
       vscode.Uri.file(path.join(this.context.extensionPath, "content")),
     ];
+    // if a workspace is created, add it as source of files
     if (vscode.workspace.workspaceFolders[0]) {
       workspaceFolder = vscode.Uri.file(
         vscode.workspace.workspaceFolders[0].uri.path
       );
-      console.log(`Using workspaceFolder ${workspaceFolder}`);
       localResourceRoots.push(workspaceFolder);
     }
     let webViewPanel = vscode.window.createWebviewPanel(
@@ -178,23 +177,27 @@ class InteractiveWebviewGenerator {
     return new PreviewPanel(this, doc.uri, webViewPanel);
   }
 
+  // extract a list of unique references to image files from the dot document
   getImageFileNamesFromDoc(doc) {
     // dot is a potentially incomplete dot document
-    const matches = doc.matchAll(/image\s*=\s*"(.*)"/g);
+    const matches = doc.matchAll(/image\s*=\s*"(.*?)"/g);
     const filenames = Array.from(matches, (m) => m[1]);
     const uniq = new Set(filenames); // remove dups
     return [...uniq];
   }
 
+  // convert image file names to protected references to workspace resources
   imageFileNamesToResNames(previewPanel, imgNames) {
-    return imgNames.map((x) => {
+    let resNames = {};
+    imgNames.forEach((x) => {
       const imgPath = path.join(
         vscode.workspace.workspaceFolders[0].uri.path,
         ...x.split("/")
       );
       const resource = vscode.Uri.file(imgPath);
-      return `${previewPanel.getPanel().webview.asWebviewUri(resource)}`;
+      resNames[x] = `${previewPanel.getPanel().webview.asWebviewUri(resource)}`;
     });
+    return resNames;
   }
 
   async updateContent(previewPanel, doc) {
@@ -202,14 +205,8 @@ class InteractiveWebviewGenerator {
       if (!previewPanel.getPanel().webview.html) {
         previewPanel.getPanel().webview.html = "Please wait...";
       }
-      // build list of images from doc
-      this.imageFiles = this.getImageFileNamesFromDoc(doc.getText());
-      // convert image files names to resource names
-      this.imageResources = this.imageFileNamesToResNames(
-        previewPanel,
-        this.imageFiles
-      );
-
+      // build list of images and map to protected resources from doc
+      this.buildImageListFromDoc(doc, previewPanel);
       previewPanel.setNeedsRebuild(false);
       previewPanel.getPanel().webview.html = await this.getPreviewHtml(
         previewPanel,
@@ -217,6 +214,17 @@ class InteractiveWebviewGenerator {
       );
       return resolve(previewPanel);
     });
+  }
+
+  // build lists of images and protected references that can be used in other parts
+  // of the process
+  buildImageListFromDoc(doc, previewPanel) {
+    this.imageFiles = this.getImageFileNamesFromDoc(doc.getText());
+    // convert image files names to resource names
+    this.imageResources = this.imageFileNamesToResNames(
+      previewPanel,
+      this.imageFiles
+    );
   }
 
   async getPreviewTemplate(context, templateName) {
@@ -232,6 +240,9 @@ class InteractiveWebviewGenerator {
     });
   }
 
+  // given a list of resource references, appends addImage commmands to the graphviz command
+  // so graphviz can show images.
+  // TODO: replace fixed image width and size with with and size from dot document
   addGraphvizImages(templateHtml, imgSrcs) {
     const gvAddImgs = imgSrcs
       .map((x) => `.addImage("${x}","100px", "100px")\n`)
@@ -242,6 +253,30 @@ class InteractiveWebviewGenerator {
     return templateWithImages;
   }
 
+  // Replace image references with protected resource references
+  replaceDotImagesWithResources(doc) {
+    const rpl = doc.replace(/image\s*=\s*"(.*?)"/g, (match, filename) => {
+      if (this.imageResources[filename])
+        return `image = "${this.imageResources[filename]}"`;
+      else {
+        console.log(
+          `Unexpected error. Could not find a resource name for ${filename}`
+        );
+        return filename;
+      }
+    });
+
+    return rpl;
+  }
+
+  processImages(doc) {
+    doc = this.replaceDotImagesWithResources(doc);
+    return doc;
+  }
+
+  // This process starts with an existing template(index.html)
+  // and replaces file references with protected resource references.
+  // In addition, it adds extra lines to allow graphviz to deal with images
   async getPreviewHtml(previewPanel, doc) {
     let templateHtml = await this.getPreviewTemplate(
       this.context,
@@ -275,32 +310,10 @@ class InteractiveWebviewGenerator {
             .getPanel()
             .webview.asWebviewUri(resource)}"/>`;
         }
-      )
-      .replace(/<img .*?src="(.+)".*\/>/g, (imgTag, srcPath) => {
-        console.log(
-          `replacing image src imgTag: ${imgTag}, srcPath: ${srcPath}`
-        );
-        const imgPath = path.join(
-          vscode.workspace.workspaceFolders[0].uri.path,
-          ...srcPath.split("/")
-        );
-        let resource = vscode.Uri.file(imgPath);
-        return `<img src="${previewPanel
-          .getPanel()
-          .webview.asWebviewUri(resource)}" />`;
-      });
-    const imageSrcs = ["uml_actor.png", "td.png"];
+      );
     templateHtml = this.addGraphvizImages(
       templateHtml,
-      imageSrcs.map((x) => {
-        const imgPath = path.join(
-          vscode.workspace.workspaceFolders[0].uri.path,
-          ...x.split("/")
-        );
-        const resource = vscode.Uri.file(imgPath);
-
-        return `${previewPanel.getPanel().webview.asWebviewUri(resource)}`;
-      })
+      Object.keys(this.imageResources).map((k) => this.imageResources[k])
     );
     return templateHtml;
   }
@@ -450,6 +463,8 @@ class PreviewPanel {
         this.onRenderFinished();
       }, this.renderLockTimeout);
     }
+    // before we render, replace image references with protected resources
+    // dotSrc = this.replaceDotImagesWithResources(dotSrc);
     this.panel.webview.postMessage({ command: "renderDot", value: dotSrc });
   }
 
